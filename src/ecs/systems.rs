@@ -935,8 +935,10 @@ pub(super) fn pump_events(
 pub(super) fn window_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: Query<(&mut Window, Entity, Has<StackAdjustedResize>)>,
+    mut workspaces: Query<&mut LayoutStrip>,
     focused: Option<Single<Entity, With<FocusedMarker>>>,
     active_display: ActiveDisplay,
+    window_manager: Res<WindowManager>,
     initializing: Option<Res<Initializing>>,
     mut commands: Commands,
 ) {
@@ -957,6 +959,51 @@ pub(super) fn window_update_frame(
                     (entity, old_frame, window.frame(), stack_adjusted)
                 };
                 let (entity, old_frame, new_frame, stack_adjusted) = info;
+
+                if matches!(event, Event::WindowMoved { .. })
+                    && active_display.active_strip().index_of(entity).is_ok()
+                {
+                    let active_workspace_id = active_display.active_strip().id();
+                    let in_active_workspace = window_manager
+                        .windows_in_workspace(active_workspace_id)
+                        .is_ok_and(|ids| ids.contains(window_id));
+
+                    if !in_active_workspace {
+                        debug!(
+                            "window {window_id} moved out of active workspace {active_workspace_id}; removing stale strip membership"
+                        );
+
+                        let next_focus = if focused.as_ref().is_some_and(|focused| **focused == entity)
+                        {
+                            active_display
+                                .active_strip()
+                                .left_neighbour(entity)
+                                .or_else(|| active_display.active_strip().right_neighbour(entity))
+                                .and_then(|neighbour| {
+                                    windows
+                                        .get(neighbour)
+                                        .ok()
+                                        .map(|(window, _, _)| window.id())
+                                })
+                        } else {
+                            None
+                        };
+
+                        for mut strip in &mut workspaces {
+                            if strip.index_of(entity).is_ok() {
+                                strip.remove(entity);
+                                break;
+                            }
+                        }
+
+                        if let Some(window_id) = next_focus {
+                            commands.trigger(WMEventTrigger(Event::WindowFocused { window_id }));
+                        } else {
+                            commands.entity(entity).try_remove::<FocusedMarker>();
+                        }
+                        continue;
+                    }
+                }
 
                 // Skip reshuffle for resize events that we caused ourselves when
                 // adjusting an adjacent stacked window's height (see below).
