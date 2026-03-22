@@ -935,9 +935,10 @@ pub(super) fn pump_events(
 pub(super) fn window_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: Query<(&mut Window, Entity, Has<StackAdjustedResize>)>,
-    mut workspaces: Query<&mut LayoutStrip>,
+    apps: Query<&Application>,
     focused: Option<Single<Entity, With<FocusedMarker>>>,
-    active_display: ActiveDisplay,
+    active_display: Single<&Display, With<ActiveDisplayMarker>>,
+    mut active_workspace: Single<&mut LayoutStrip, With<ActiveWorkspaceMarker>>,
     window_manager: Res<WindowManager>,
     initializing: Option<Res<Initializing>>,
     mut commands: Commands,
@@ -961,9 +962,9 @@ pub(super) fn window_update_frame(
                 let (entity, old_frame, new_frame, stack_adjusted) = info;
 
                 if matches!(event, Event::WindowMoved { .. })
-                    && active_display.active_strip().index_of(entity).is_ok()
+                    && active_workspace.index_of(entity).is_ok()
                 {
-                    let active_workspace_id = active_display.active_strip().id();
+                    let active_workspace_id = active_workspace.id();
                     let in_active_workspace = window_manager
                         .windows_in_workspace(active_workspace_id)
                         .is_ok_and(|ids| ids.contains(window_id));
@@ -973,31 +974,35 @@ pub(super) fn window_update_frame(
                             "window {window_id} moved out of active workspace {active_workspace_id}; removing stale strip membership"
                         );
 
-                        let next_focus = if focused.as_ref().is_some_and(|focused| **focused == entity)
-                        {
-                            active_display
-                                .active_strip()
+                        let next_focus = if focused.as_ref().is_some_and(|focused| **focused == entity) {
+                            active_workspace
                                 .left_neighbour(entity)
-                                .or_else(|| active_display.active_strip().right_neighbour(entity))
+                                .or_else(|| active_workspace.right_neighbour(entity))
                                 .and_then(|neighbour| {
                                     windows
                                         .get(neighbour)
                                         .ok()
-                                        .map(|(window, _, _)| window.id())
+                                        .map(|(window, _, _)| (window.id(), neighbour))
                                 })
                         } else {
                             None
                         };
 
-                        for mut strip in &mut workspaces {
-                            if strip.index_of(entity).is_ok() {
-                                strip.remove(entity);
-                                break;
-                            }
-                        }
+                        active_workspace.remove(entity);
 
-                        if let Some(window_id) = next_focus {
+                        if let Some((window_id, next_entity)) = next_focus {
+                            if let Ok((next_window, _, _)) = windows.get(next_entity)
+                                && let Ok(next_pid) = next_window.pid()
+                                && let Some(psn) = apps
+                                    .iter()
+                                    .find(|app| app.pid() == next_pid)
+                                    .map(|app| app.psn())
+                            {
+                                next_window.focus_with_raise(psn);
+                            }
+
                             commands.trigger(WMEventTrigger(Event::WindowFocused { window_id }));
+                            reshuffle_around(next_entity, &mut commands);
                         } else {
                             commands.entity(entity).try_remove::<FocusedMarker>();
                         }
@@ -1012,7 +1017,7 @@ pub(super) fn window_update_frame(
                     continue;
                 }
 
-                if active_display.active_strip().index_of(entity).is_err() {
+                if active_workspace.index_of(entity).is_err() {
                     // Do not reshuffle for floating windows or on other displays or
                     // workspaces.
                     continue;
@@ -1029,9 +1034,7 @@ pub(super) fn window_update_frame(
                     let is_top_edge_drag = old_frame.min.y != new_frame.min.y
                         && old_frame.max.y.abs_diff(new_frame.max.y) <= 2;
 
-                    if is_top_edge_drag
-                        && let Some(above_entity) = active_display.active_strip().above(entity)
-                    {
+                    if is_top_edge_drag && let Some(above_entity) = active_workspace.above(entity) {
                         if let Ok((mut above_window, _, _)) = windows.get_mut(above_entity) {
                             let above_frame = above_window.frame();
                             let new_height = new_frame.min.y - above_frame.min.y;

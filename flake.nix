@@ -43,9 +43,23 @@
       packages.aarch64-darwin.default = self.packages.aarch64-darwin.paneru;
       packages.aarch64-darwin.paneru = package;
 
-      # Allows running `nix develop` to get a shell with `paneru` available.
+      # Development shell with Rust tooling; does not install paneru itself.
       devShells."aarch64-darwin".default = pkgs.mkShellNoCC {
-        packages = [ package ];
+        packages = with pkgs; [
+          cargo
+          rustc
+          clippy
+          rustfmt
+          rust-analyzer
+        ];
+
+        # Helpful for rust-analyzer and tools that need std sources.
+        RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+
+        # Keep private framework link setup available in the dev shell too.
+        buildInputs = [
+          pkgs.apple-sdk.privateFrameworksHook
+        ];
       };
 
       homeModules.paneru =
