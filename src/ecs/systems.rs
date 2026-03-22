@@ -961,8 +961,10 @@ pub(super) fn window_update_frame(
                 };
                 let (entity, old_frame, new_frame, stack_adjusted) = info;
 
-                if matches!(event, Event::WindowMoved { .. })
-                    && active_workspace.index_of(entity).is_ok()
+                if matches!(
+                    event,
+                    Event::WindowMoved { .. } | Event::WindowResized { .. }
+                ) && active_workspace.index_of(entity).is_ok()
                 {
                     let active_workspace_id = active_workspace.id();
                     let in_active_workspace = window_manager
@@ -974,21 +976,24 @@ pub(super) fn window_update_frame(
                             "window {window_id} moved out of active workspace {active_workspace_id}; removing stale strip membership"
                         );
 
-                        let next_focus = if focused.as_ref().is_some_and(|focused| **focused == entity) {
-                            active_workspace
-                                .left_neighbour(entity)
-                                .or_else(|| active_workspace.right_neighbour(entity))
-                                .and_then(|neighbour| {
-                                    windows
-                                        .get(neighbour)
-                                        .ok()
-                                        .map(|(window, _, _)| (window.id(), neighbour))
-                                })
-                        } else {
-                            None
-                        };
+                        let next_focus =
+                            if focused.as_ref().is_some_and(|focused| **focused == entity) {
+                                active_workspace
+                                    .left_neighbour(entity)
+                                    .or_else(|| active_workspace.right_neighbour(entity))
+                                    .and_then(|neighbour| {
+                                        windows
+                                            .get(neighbour)
+                                            .ok()
+                                            .map(|(window, _, _)| (window.id(), neighbour))
+                                    })
+                            } else {
+                                None
+                            };
 
                         active_workspace.remove(entity);
+                        commands.entity(entity).try_remove::<RepositionMarker>();
+                        commands.entity(entity).try_remove::<ResizeMarker>();
 
                         if let Some((window_id, next_entity)) = next_focus {
                             if let Ok((next_window, _, _)) = windows.get(next_entity)

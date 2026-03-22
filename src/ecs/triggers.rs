@@ -21,8 +21,8 @@ use super::{
 use crate::config::{Config, WindowParams};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Configuration, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, LocateDockTrigger, SendMessageTrigger, WindowSwipeMarker,
-    reposition_entity, reshuffle_around, resize_entity,
+    ActiveWorkspaceMarker, LocateDockTrigger, RepositionMarker, ResizeMarker, SendMessageTrigger,
+    WindowSwipeMarker, reposition_entity, reshuffle_around, resize_entity,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -277,6 +277,7 @@ pub(super) fn active_workspace_trigger(
     trigger: On<Add, ActiveWorkspaceMarker>,
     windows: Windows,
     mut workspaces: Query<&mut LayoutStrip, With<ChildOf>>,
+    active_display: Single<&Display, With<ActiveDisplayMarker>>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -306,6 +307,26 @@ pub(super) fn active_workspace_trigger(
                 strip.append(entity);
             }
         });
+
+        commands.entity(entity).try_remove::<RepositionMarker>();
+        commands.entity(entity).try_remove::<ResizeMarker>();
+
+        if let Some(window) = windows.get(entity) {
+            let frame = window.frame();
+            let bounds = active_display.bounds();
+            let outside = frame.max.x <= bounds.min.x
+                || frame.min.x >= bounds.max.x
+                || frame.max.y <= bounds.min.y
+                || frame.min.y >= bounds.max.y;
+
+            if outside {
+                let origin = Origin::new(
+                    bounds.min.x + (bounds.width() - frame.width()).max(0) / 2,
+                    bounds.min.y + (bounds.height() - frame.height()).max(0) / 2,
+                );
+                reposition_entity(entity, origin, active_display.id(), &mut commands);
+            }
+        }
 
         reshuffle_around(entity, &mut commands);
     }
