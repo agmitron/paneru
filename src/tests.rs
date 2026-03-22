@@ -14,13 +14,14 @@ use tracing::{Level, debug, instrument};
 use crate::commands::{Command, Direction, Operation, register_commands};
 use crate::config::Config;
 use crate::ecs::{
-    BProcess, ExistingMarker, FocusFollowsMouse, FocusedMarker, Initializing, MissionControlActive,
-    PollForNotifications, SkipReshuffle, SpawnWindowTrigger, register_systems, register_triggers,
+    ActiveWorkspaceMarker, BProcess, ExistingMarker, FocusFollowsMouse, FocusedMarker,
+    Initializing, MissionControlActive, PollForNotifications, RepositionMarker, ResizeMarker,
+    SkipReshuffle, SpawnWindowTrigger, register_systems, register_triggers,
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
 use crate::manager::{
-    Application, ApplicationApi, Display, Origin, ProcessApi, Size, Window, WindowApi,
+    Application, ApplicationApi, Display, LayoutStrip, Origin, ProcessApi, Size, Window, WindowApi,
     WindowManager, WindowManagerApi,
 };
 use crate::platform::{ConnID, Pid, WinID, WorkspaceId};
@@ -29,6 +30,7 @@ use crate::{platform::ProcessSerialNumber, util::AXUIWrapper};
 const TEST_PROCESS_ID: i32 = 1;
 const TEST_DISPLAY_ID: u32 = 1;
 const TEST_WORKSPACE_ID: u64 = 2;
+const TEST_OTHER_WORKSPACE_ID: u64 = 3;
 const TEST_DISPLAY_WIDTH: i32 = 1024;
 const TEST_DISPLAY_HEIGHT: i32 = 768;
 
@@ -200,6 +202,8 @@ impl ApplicationApi for MockApplication {
 /// A mock implementation of the `WindowManagerApi` trait for testing purposes.
 struct MockWindowManager {
     windows: Box<dyn Fn(WorkspaceId) -> Vec<Window> + Send + Sync + 'static>,
+    workspaces: Vec<WorkspaceId>,
+    active_workspace: Arc<RwLock<WorkspaceId>>,
 }
 
 impl std::fmt::Debug for MockWindowManager {
@@ -238,7 +242,7 @@ impl WindowManagerApi for MockWindowManager {
             IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
             TEST_MENUBAR_HEIGHT,
         );
-        vec![(display, vec![TEST_WORKSPACE_ID])]
+        vec![(display, self.workspaces.clone())]
     }
 
     /// Returns a predefined active display ID.
@@ -250,7 +254,7 @@ impl WindowManagerApi for MockWindowManager {
     /// Returns a predefined active display space ID.
     #[instrument(level = Level::DEBUG, skip(self), ret)]
     fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId> {
-        Ok(TEST_WORKSPACE_ID)
+        Ok(*self.active_workspace.read().unwrap())
     }
 
     /// Does nothing, as mouse centering is not tested at this level.
@@ -308,6 +312,28 @@ impl WindowManagerApi for MockWindowManager {
     #[instrument(level = Level::DEBUG, skip(self))]
     fn setup_config_watcher(&self, path: &std::path::Path) -> Result<Box<dyn notify::Watcher>> {
         todo!()
+    }
+}
+
+impl MockWindowManager {
+    fn new(windows: Box<dyn Fn(WorkspaceId) -> Vec<Window> + Send + Sync + 'static>) -> Self {
+        Self {
+            windows,
+            workspaces: vec![TEST_WORKSPACE_ID],
+            active_workspace: Arc::new(RwLock::new(TEST_WORKSPACE_ID)),
+        }
+    }
+
+    fn with_workspaces(
+        windows: Box<dyn Fn(WorkspaceId) -> Vec<Window> + Send + Sync + 'static>,
+        workspaces: Vec<WorkspaceId>,
+        active_workspace: Arc<RwLock<WorkspaceId>>,
+    ) -> Self {
+        Self {
+            windows,
+            workspaces,
+            active_workspace,
+        }
     }
 }
 
@@ -689,7 +715,7 @@ fn test_window_shuffle() {
             })
             .collect::<Vec<_>>()
     });
-    let window_manager = MockWindowManager { windows };
+    let window_manager = MockWindowManager::new(windows);
     bevy.world_mut()
         .insert_resource(WindowManager(Box::new(window_manager)));
 
@@ -755,7 +781,7 @@ fn test_startup_windows() {
             })
             .collect::<Vec<_>>()
     });
-    let window_manager = MockWindowManager { windows };
+    let window_manager = MockWindowManager::new(windows);
     bevy.world_mut()
         .insert_resource(WindowManager(Box::new(window_manager)));
 
@@ -809,7 +835,7 @@ fn test_dont_focus() {
             })
             .collect::<Vec<_>>()
     });
-    let window_manager = MockWindowManager { windows };
+    let window_manager = MockWindowManager::new(windows);
     bevy.world_mut()
         .insert_resource(WindowManager(Box::new(window_manager)));
 
@@ -859,5 +885,286 @@ index = 100
     .try_into()
     .unwrap();
     bevy.insert_resource(config);
+    run_main_loop(&mut bevy, &internal_queue, &commands, check);
+}
+
+#[test]
+fn test_focus_does_not_switch_to_window_moved_to_another_workspace() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 }, // Noop allowing everything to settle
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::WindowMoved { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+    ];
+
+    let mut bevy = setup_world();
+    let app = setup_process(bevy.world_mut());
+    let internal_queue = Arc::new(RwLock::new(Vec::<Event>::new()));
+    let event_queue = internal_queue.clone();
+    let moved_out = Arc::new(RwLock::new(false));
+    let moved_out_reader = moved_out.clone();
+    let windows_app = app.clone();
+
+    let windows = Box::new(move |workspace_id| {
+        let include_moved_window =
+            workspace_id != TEST_WORKSPACE_ID || !*moved_out_reader.read().unwrap();
+
+        (0..2)
+            .filter(|id| *id != 0 || include_moved_window)
+            .map(|i| {
+                let origin = Origin::new(100 * i, 0);
+                let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+                let window = MockWindow::new(
+                    i,
+                    IRect {
+                        min: origin,
+                        max: origin + size,
+                    },
+                    event_queue.clone(),
+                    windows_app.clone(),
+                );
+                Window::new(Box::new(window))
+            })
+            .collect::<Vec<_>>()
+    });
+    let window_manager = MockWindowManager::new(windows);
+    bevy.world_mut()
+        .insert_resource(WindowManager(Box::new(window_manager)));
+
+    let check = |iteration, world: &mut World| {
+        let focused_window_id = {
+            let mut focused_query = world.query::<(&Window, Has<FocusedMarker>)>();
+            focused_query
+                .iter(world)
+                .find_map(|(window, focused)| focused.then_some(window.id()))
+        };
+
+        match iteration {
+            2 => {
+                assert_eq!(focused_window_id, Some(0));
+                *moved_out.write().unwrap() = true;
+            }
+            3 => {
+                assert_eq!(focused_window_id, Some(1));
+
+                let active_entities = {
+                    let mut strips = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+                    strips
+                        .iter(world)
+                        .find_map(|(strip, active)| active.then(|| strip.all_windows()))
+                        .unwrap_or_default()
+                };
+                let mut windows = world.query::<&Window>();
+                let active_ids = active_entities
+                    .into_iter()
+                    .filter_map(|entity| windows.get(world, entity).ok().map(|window| window.id()))
+                    .collect::<Vec<_>>();
+                assert_eq!(active_ids, vec![1]);
+            }
+            4 => {
+                assert_eq!(focused_window_id, Some(1));
+                assert_eq!(app.inner.force_read().focused_id, Some(1));
+            }
+            _ => {}
+        }
+    };
+
+    run_main_loop(&mut bevy, &internal_queue, &commands, check);
+}
+
+#[test]
+fn test_focus_does_not_switch_to_fullscreen_window_moved_by_resize_event() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 }, // Noop allowing everything to settle
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::WindowResized { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+    ];
+
+    let mut bevy = setup_world();
+    let app = setup_process(bevy.world_mut());
+    let internal_queue = Arc::new(RwLock::new(Vec::<Event>::new()));
+    let event_queue = internal_queue.clone();
+    let moved_out = Arc::new(RwLock::new(false));
+    let moved_out_reader = moved_out.clone();
+    let windows_app = app.clone();
+
+    let windows = Box::new(move |workspace_id| {
+        let include_moved_window =
+            workspace_id != TEST_WORKSPACE_ID || !*moved_out_reader.read().unwrap();
+
+        (0..2)
+            .filter(|id| *id != 0 || include_moved_window)
+            .map(|i| {
+                let origin = Origin::new(100 * i, 0);
+                let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+                let window = MockWindow::new(
+                    i,
+                    IRect {
+                        min: origin,
+                        max: origin + size,
+                    },
+                    event_queue.clone(),
+                    windows_app.clone(),
+                );
+                Window::new(Box::new(window))
+            })
+            .collect::<Vec<_>>()
+    });
+    let window_manager = MockWindowManager::new(windows);
+    bevy.world_mut()
+        .insert_resource(WindowManager(Box::new(window_manager)));
+
+    let check = |iteration, world: &mut World| {
+        let focused_window_id = {
+            let mut focused_query = world.query::<(&Window, Has<FocusedMarker>)>();
+            focused_query
+                .iter(world)
+                .find_map(|(window, focused)| focused.then_some(window.id()))
+        };
+
+        match iteration {
+            2 => {
+                assert_eq!(focused_window_id, Some(0));
+                *moved_out.write().unwrap() = true;
+            }
+            3 => {
+                assert_eq!(focused_window_id, Some(1));
+
+                let active_entities = {
+                    let mut strips = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+                    strips
+                        .iter(world)
+                        .find_map(|(strip, active)| active.then(|| strip.all_windows()))
+                        .unwrap_or_default()
+                };
+                let mut windows = world.query::<&Window>();
+                let active_ids = active_entities
+                    .into_iter()
+                    .filter_map(|entity| windows.get(world, entity).ok().map(|window| window.id()))
+                    .collect::<Vec<_>>();
+                assert_eq!(active_ids, vec![1]);
+            }
+            4 => {
+                assert_eq!(focused_window_id, Some(1));
+                assert_eq!(app.inner.force_read().focused_id, Some(1));
+            }
+            _ => {}
+        }
+    };
+
+    run_main_loop(&mut bevy, &internal_queue, &commands, check);
+}
+
+#[test]
+fn test_workspace_switch_clears_stale_motion_markers_for_moved_window() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 }, // Noop allowing everything to settle
+        Event::WindowMoved { window_id: 0 },
+        Event::SpaceChanged,
+    ];
+
+    let mut bevy = setup_world();
+    let app = setup_process(bevy.world_mut());
+    let internal_queue = Arc::new(RwLock::new(Vec::<Event>::new()));
+    let event_queue = internal_queue.clone();
+    let moved_out = Arc::new(RwLock::new(false));
+    let moved_out_reader = moved_out.clone();
+    let active_workspace = Arc::new(RwLock::new(TEST_WORKSPACE_ID));
+    let active_workspace_reader = active_workspace.clone();
+
+    let windows = Box::new(move |workspace_id| {
+        let include_window_0 = workspace_id == TEST_OTHER_WORKSPACE_ID
+            || (workspace_id == TEST_WORKSPACE_ID && !*moved_out_reader.read().unwrap());
+
+        let mut ids = vec![1];
+        if include_window_0 {
+            ids.insert(0, 0);
+        }
+
+        ids.into_iter()
+            .map(|i| {
+                let origin = if i == 0 {
+                    Origin::new(-6000, 0)
+                } else {
+                    Origin::new(100, 0)
+                };
+                let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+                let window = MockWindow::new(
+                    i,
+                    IRect {
+                        min: origin,
+                        max: origin + size,
+                    },
+                    event_queue.clone(),
+                    app.clone(),
+                );
+                Window::new(Box::new(window))
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let window_manager = MockWindowManager::with_workspaces(
+        windows,
+        vec![TEST_WORKSPACE_ID, TEST_OTHER_WORKSPACE_ID],
+        active_workspace,
+    );
+    bevy.world_mut()
+        .insert_resource(WindowManager(Box::new(window_manager)));
+
+    let check = |iteration, world: &mut World| match iteration {
+        0 => {
+            *moved_out.write().unwrap() = true;
+
+            let mut windows = world.query::<(Entity, &Window)>();
+            if let Some((entity, _)) = windows.iter(world).find(|(_, window)| window.id() == 0) {
+                world.entity_mut(entity).insert((
+                    RepositionMarker {
+                        origin: Origin::new(-9000, 0),
+                        display_id: TEST_DISPLAY_ID,
+                    },
+                    ResizeMarker {
+                        size: Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+                        display_id: TEST_DISPLAY_ID,
+                    },
+                ));
+            }
+        }
+        1 => {
+            *active_workspace_reader.write().unwrap() = TEST_OTHER_WORKSPACE_ID;
+        }
+        2 => {
+            let mut windows = world.query::<(&Window, Has<RepositionMarker>, Has<ResizeMarker>)>();
+            let state = windows
+                .iter(world)
+                .find(|(window, _, _)| window.id() == 0)
+                .map(|(window, has_reposition, has_resize)| {
+                    (window.frame(), has_reposition, has_resize)
+                })
+                .expect("window 0 should exist");
+
+            assert!(
+                !state.1 && !state.2,
+                "window moved to active workspace should not keep stale motion markers"
+            );
+            assert!(state.0.width() > 0);
+        }
+        _ => {}
+    };
+
     run_main_loop(&mut bevy, &internal_queue, &commands, check);
 }

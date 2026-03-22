@@ -180,6 +180,7 @@ fn command_move_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
+    window_manager: Res<WindowManager>,
     apps: Query<&Application>,
     mut commands: Commands,
 ) {
@@ -192,17 +193,25 @@ fn command_move_focus(
     let Some((_, entity)) = windows.focused() else {
         return;
     };
-    if let Some(window) = get_window_in_direction(direction, entity, active_display.active_strip())
-        .inspect(|entity| {
-            if let Some(window) = windows.get(*entity)
-                && let Some(psn) = windows.psn(window.id(), &apps)
-            {
-                window.focus_with_raise(psn);
-            }
-        })
+    let active_workspace_windows = window_manager
+        .windows_in_workspace(active_display.active_strip().id())
+        .ok();
+
+    if let Some(next_entity) =
+        get_window_in_direction(direction, entity, active_display.active_strip())
+        && let Some(next_window) = windows.get(next_entity)
     {
-        reshuffle_around(window, &mut commands);
-        return;
+        let in_active_workspace = active_workspace_windows
+            .as_ref()
+            .is_none_or(|ids| ids.contains(&next_window.id()));
+
+        if in_active_workspace {
+            if let Some(psn) = windows.psn(next_window.id(), &apps) {
+                next_window.focus_with_raise(psn);
+            }
+            reshuffle_around(next_entity, &mut commands);
+            return;
+        }
     }
 
     // Check if the movement can switch to another display.
